@@ -1,0 +1,114 @@
+name: Manual Package Test and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      r-version:
+        description: 'R version to use'
+        required: true
+        default: '4.4'
+
+jobs:
+  test-and-release:
+    strategy:
+      matrix:
+        config:
+          - {os: windows-latest, r: '${{ github.event.inputs.r-version }}', url_template: 'https://bioc.r-universe.dev/bin/windows/contrib/{r_version}/{package_name}_{package_version}.zip'}
+          - {os: macos-latest-large, r: '${{ github.event.inputs.r-version }}', url_template: 'https://bioc.r-universe.dev/bin/macosx/big-sur-x86_64/contrib/{r_version}/{package_name}_{package_version}.tgz'}
+          - {os: macos-latest, r: '${{ github.event.inputs.r-version }}', url_template: 'https://bioc.r-universe.dev/bin/macosx/big-sur-arm64/contrib/{r_version}/{package_name}_{package_version}.tgz', fallback_url_template: 'https://bioc.r-universe.dev/bin/macosx/big-sur-x86_64/contrib/{r_version}/{package_name}_{package_version}.tgz'}
+          - {os: ubuntu-latest, r: '${{ github.event.inputs.r-version }}', container: 'ghcr.io/bioconductor/bioconductor:devel', url_template: 'https://bioc.r-universe.dev/src/contrib/{package_name}_{package_version}.tar.gz'}
+
+    runs-on: ${{ matrix.config.os }}
+    container: ${{ matrix.config.container }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set package name and version
+      id: pkg_info
+      run: |
+        echo "pkg_name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+        echo "pkg_version=$(grep "Version:" DESCRIPTION | awk '{print $2}')" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Set up R ${{ matrix.config.r }}
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: ${{ matrix.config.r }}
+
+    - name: Generate download URL
+      id: get_url
+      run: |
+        url="${{ matrix.config.url_template }}"
+        url="${url/\{r_version\}/${{ matrix.config.r }}}"
+        url="${url/\{package_name\}/${{ steps.pkg_info.outputs.pkg_name }}}"
+        url="${url/\{package_version\}/${{ steps.pkg_info.outputs.pkg_version }}}"
+        echo "download_url=$url" >> $GITHUB_OUTPUT
+        
+        if [[ -n "${{ matrix.config.fallback_url_template }}" ]]; then
+          fallback_url="${{ matrix.config.fallback_url_template }}"
+          fallback_url="${fallback_url/\{r_version\}/${{ matrix.config.r }}}"
+          fallback_url="${fallback_url/\{package_name\}/${{ steps.pkg_info.outputs.pkg_name }}}"
+          fallback_url="${fallback_url/\{package_version\}/${{ steps.pkg_info.outputs.pkg_version }}}"
+          echo "fallback_url=$fallback_url" >> $GITHUB_OUTPUT
+        fi
+      shell: bash
+
+    - name: Download package
+      run: |
+        if [[ -n "${{ matrix.config.fallback_url_template }}" ]]; then
+          if curl --output /dev/null --silent --head --fail "${{ steps.get_url.outputs.download_url }}"; then
+            curl -O "${{ steps.get_url.outputs.download_url }}"
+          else
+            echo "binary ${{ steps.get_url.outputs.download_url }} not found, using fallback ${{ steps.get_url.outputs.fallback_url }} instead"
+            curl -O "${{ steps.get_url.outputs.fallback_url }}"
+          fi
+        else
+          curl -O "${{ steps.get_url.outputs.download_url }}"
+        fi
+      shell: bash
+
+    - name: Install package
+      run: |
+        install.packages(list.files(pattern="${{ steps.pkg_info.outputs.pkg_name }}.*\\.(tar\\.gz|tgz|zip)$"), repos=NULL, type="source")
+      shell: Rscript {0}
+
+    - name: Run vignettes
+      run: |
+        devtools::build_vignettes(package = "${{ steps.pkg_info.outputs.pkg_name }}")
+      shell: Rscript {0}
+
+    - name: Check if release exists
+      id: check_release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        version="${{ steps.pkg_info.outputs.pkg_version }}"
+        if gh release view v$version &>/dev/null; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+      shell: bash
+
+    - name: Create release
+      if: steps.check_release.outputs.exists == 'false'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        version="${{ steps.pkg_info.outputs.pkg_version }}"
+        gh release create v$version \
+          --title "${{ steps.pkg_info.outputs.pkg_name }} $version" \
+          --notes "Release for R version ${{ github.event.inputs.r-version }}"
+
+        for asset in ${{ steps.pkg_info.outputs.pkg_name }}*.*; do
+          gh release upload v$version "$asset"
+        done
+      shell: bash
+
+    - name: Fail if release already exists
+      if: steps.check_release.outputs.exists == 'true'
+      run: |
+        echo "Release v${{ steps.pkg_info.outputs.pkg_version }} already exists. Tests were run, but no new release was created."
+        exit 1
+      shell: bash
